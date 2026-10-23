@@ -142,6 +142,8 @@ sudo ufw allow 53 comment "dnsmasq DNS Server"
 
 # Terapkan perubahan firewall
 sudo ufw reload
+```
+
 ---
 ## Lisensi
 
