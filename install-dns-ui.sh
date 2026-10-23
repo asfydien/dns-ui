@@ -3,7 +3,7 @@
 # Installer Otomatis DNS Zone Editor (dnsmasq)
 # Repositori: asfydien/dns-ui
 # Port Default: 1919
-# Mendukung Record: A, AAAA, CNAME, MX, TXT
+# Fitur: Record A, AAAA, CNAME, MX, TXT
 # ==========================================================
 
 set -e
@@ -33,13 +33,14 @@ APP_DIR="/opt/dns-ui"
 echo "[*] Menyiapkan direktori aplikasi di ${APP_DIR}..."
 mkdir -p "${APP_DIR}"
 
-# 4. Tulis aplikasi PHP terintegrasi (Backend + Frontend)
+# 4. Tulis aplikasi PHP terintegrasi (Backend + Frontend dengan PRG Pattern)
 cat << 'EOF' > "${APP_DIR}/index.php"
 <?php
-$configFile = '/etc/dnsmasq.d/custom_records.conf';
-$message = '';
-$error = '';
+session_start();
 
+$configFile = '/etc/dnsmasq.d/custom_records.conf';
+
+// Parsing berkas dnsmasq ke array terstruktur
 function parseDnsRecords($filePath) {
     $records = [];
     if (!file_exists($filePath)) return $records;
@@ -88,6 +89,7 @@ function parseDnsRecords($filePath) {
     return $records;
 }
 
+// Proses form POST
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
@@ -110,11 +112,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $entry = "txt-record={$domain},\"{$escapedTarget}\"\n";
             }
 
-            file_put_contents($configFile, $entry, FILE_APPEND | LOCK_EX);
-            shell_exec('systemctl restart dnsmasq');
-            $message = "Record {$type} [{$domain}] berhasil ditambahkan!";
+            // Validasi cegah record duplikat
+            $currentData = file_exists($configFile) ? file_get_contents($configFile) : '';
+            if (str_contains($currentData, trim($entry))) {
+                $_SESSION['error'] = "Record {$type} [{$domain}] sudah terdaftar!";
+            } else {
+                file_put_contents($configFile, $entry, FILE_APPEND | LOCK_EX);
+                shell_exec('systemctl restart dnsmasq');
+                $_SESSION['message'] = "Record {$type} [{$domain}] berhasil ditambahkan!";
+            }
         } else {
-            $error = "Domain dan Target/Nilai wajib diisi.";
+            $_SESSION['error'] = "Domain dan Target/Nilai wajib diisi.";
         }
     } elseif ($action === 'delete') {
         $idToDelete = (int)$_POST['id'];
@@ -123,10 +131,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             unset($lines[$idToDelete]);
             file_put_contents($configFile, implode("\n", $lines) . (count($lines) > 0 ? "\n" : ""), LOCK_EX);
             shell_exec('systemctl restart dnsmasq');
-            $message = "Record DNS berhasil dihapus.";
+            $_SESSION['message'] = "Record DNS berhasil dihapus.";
         }
     }
+
+    // Pola PRG (Post/Redirect/Get) untuk mencegah resubmission saat refresh
+    header("Location: index.php");
+    exit;
 }
+
+// Ambil notifikasi dari session dan kosongkan
+$message = $_SESSION['message'] ?? '';
+$error = $_SESSION['error'] ?? '';
+unset($_SESSION['message'], $_SESSION['error']);
 
 $records = parseDnsRecords($configFile);
 $rawConfig = file_exists($configFile) ? file_get_contents($configFile) : '';
