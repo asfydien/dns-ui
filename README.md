@@ -46,7 +46,7 @@ Aplikasi ini dirancang untuk skenario 1 VM Server (Debian) dengan PC Host fisik 
 Jalankan perintah berikut langsung di terminal VM Debian:
 
 ```bash
-curl -sSL [https://raw.githubusercontent.com/asfydien/dns-ui/main/install-dns-ui.sh](https://raw.githubusercontent.com/asfydien/dns-ui/main/install-dns-ui.sh) | sudo bash
+curl -sSL https://raw.githubusercontent.com/asfydien/dns-ui/main/install-dns-ui.sh | sudo bash
 ```
 
 ### 2. Instalasi Manual via Git
@@ -54,7 +54,7 @@ curl -sSL [https://raw.githubusercontent.com/asfydien/dns-ui/main/install-dns-ui
 Jika ingin meninjau skrip sebelum mengeksekusi:
 
 ```bash
-git clone [https://github.com/asfydien/dns-ui.git](https://github.com/asfydien/dns-ui.git)
+git clone https://github.com/asfydien/dns-ui.git
 cd dns-ui
 chmod +x install-dns-ui.sh
 sudo ./install-dns-ui.sh
