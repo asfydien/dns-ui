@@ -125,7 +125,24 @@ Layanan web UI dikelola melalui `systemd`:
   ```
 
 ---
+## Catatan Integrasi: CloudPanel & Firewall (UFW)
 
+Jika menjalankan `dns-ui` bersamaan dengan kontrol panel hosting seperti **CloudPanel**, skrip instalasi panel tersebut secara otomatis akan mengaktifkan firewall `ufw` dan mengunci seluruh port yang tidak digunakan oleh layanannya. 
+
+Kondisi ini menyebabkan port web **1919** (`dns-ui`) dan port **53** (`dnsmasq`) terblokir dari akses jaringan luar (host).
+
+Untuk mengizinkan lalu lintas data kembali, jalankan perintah berikut di terminal VM:
+
+```bash
+# Buka port web DNS UI
+sudo ufw allow 1919/tcp comment "DNS UI Web"
+
+# Buka port DNS dnsmasq (TCP & UDP)
+sudo ufw allow 53 comment "dnsmasq DNS Server"
+
+# Terapkan perubahan firewall
+sudo ufw reload
+---
 ## Lisensi
 
 Proyek ini didistribusikan di bawah lisensi **MIT**. Silakan gunakan, modifikasi, dan bagikan kembali untuk keperluan pendidikan maupun praktikum.
