@@ -1,7 +1,9 @@
 #!/bin/bash
 # ==========================================================
 # Installer Otomatis DNS Zone Editor (dnsmasq)
+# Repositori: asfydien/dns-ui
 # Port Default: 1919
+# Mendukung Record: A, AAAA, CNAME, MX, TXT
 # ==========================================================
 
 set -e
@@ -35,45 +37,84 @@ mkdir -p "${APP_DIR}"
 cat << 'EOF' > "${APP_DIR}/index.php"
 <?php
 $configFile = '/etc/dnsmasq.d/custom_records.conf';
-$message = '';$error = '';
+$message = '';
+$error = '';
 
-function parseDnsRecords($filePath) {$records = [];
-    if (!file_exists($filePath)) return$records;
+function parseDnsRecords($filePath) {
+    $records = [];
+    if (!file_exists($filePath)) return $records;
     
     $lines = file($filePath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    foreach ($lines as $index =>$line) {
+    foreach ($lines as $index => $line) {
         $line = trim($line);
         if (str_starts_with($line, '#')) continue;
 
-        if (preg_match('/^address=\/(.+?)\/(.+)$/', $line,$m)) {
-            $records[] = ['id' =>$index, 'type' => 'A', 'domain' => $m[1], 'target' =>$m[2], 'priority' => '-'];
-        } elseif (preg_match('/^cname=(.+?),(.*)$/', $line,$m)) {
-            $records[] = ['id' =>$index, 'type' => 'CNAME', 'domain' => $m[1], 'target' =>$m[2], 'priority' => '-'];
-        } elseif (preg_match('/^mx-host=(.+?),(.*?)(?:,(\d+))?$/',$line, $m)) {$records[] = ['id' => $index, 'type' => 'MX', 'domain' =>$m[1], 'target' => $m[2], 'priority' =>$m[3] ?? '10'];
+        if (preg_match('/^address=\/(.+?)\/(.+)$/', $line, $m)) {
+            $isIpv6 = str_contains($m[2], ':');
+            $records[] = [
+                'id' => $index, 
+                'type' => $isIpv6 ? 'AAAA' : 'A', 
+                'domain' => $m[1], 
+                'target' => $m[2], 
+                'priority' => '-'
+            ];
+        } elseif (preg_match('/^cname=(.+?),(.*)$/', $line, $m)) {
+            $records[] = [
+                'id' => $index, 
+                'type' => 'CNAME', 
+                'domain' => $m[1], 
+                'target' => $m[2], 
+                'priority' => '-'
+            ];
+        } elseif (preg_match('/^mx-host=(.+?),(.*?)(?:,(\d+))?$/', $line, $m)) {
+            $records[] = [
+                'id' => $index, 
+                'type' => 'MX', 
+                'domain' => $m[1], 
+                'target' => $m[2], 
+                'priority' => $m[3] ?? '10'
+            ];
+        } elseif (preg_match('/^txt-record=(.+?),(.*)$/', $line, $m)) {
+            $cleanTarget = trim($m[2], '"');
+            $records[] = [
+                'id' => $index, 
+                'type' => 'TXT', 
+                'domain' => $m[1], 
+                'target' => $cleanTarget, 
+                'priority' => '-'
+            ];
         }
     }
     return $records;
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action =$_POST['action'] ?? '';
+    $action = $_POST['action'] ?? '';
 
     if ($action === 'add') {
-        $type =$_POST['type'] ?? 'A';
+        $type = $_POST['type'] ?? 'A';
         $domain = trim($_POST['domain'] ?? '');
         $target = trim($_POST['target'] ?? '');
         $prio = (int)($_POST['priority'] ?? 10);
 
-        if ($domain !== '' && $target !== '') {$entry = '';
-            if ($type === 'A')$entry = "address=/{$domain}/{$target}\n";
-            elseif ($type === 'CNAME')$entry = "cname={$domain},{$target}\n";
-            elseif ($type === 'MX') $entry = "mx-host={$domain},{$target},{$prio}\n";
+        if ($domain !== '' && $target !== '') {
+            $entry = '';
+            if ($type === 'A' || $type === 'AAAA') {
+                $entry = "address=/{$domain}/{$target}\n";
+            } elseif ($type === 'CNAME') {
+                $entry = "cname={$domain},{$target}\n";
+            } elseif ($type === 'MX') {
+                $entry = "mx-host={$domain},{$target},{$prio}\n";
+            } elseif ($type === 'TXT') {
+                $escapedTarget = trim($target, '"');
+                $entry = "txt-record={$domain},\"{$escapedTarget}\"\n";
+            }
 
-            file_put_contents($configFile,$entry, FILE_APPEND | LOCK_EX);
+            file_put_contents($configFile, $entry, FILE_APPEND | LOCK_EX);
             shell_exec('systemctl restart dnsmasq');
             $message = "Record {$type} [{$domain}] berhasil ditambahkan!";
         } else {
-            $error = "Domain dan Target wajib diisi.";
+            $error = "Domain dan Target/Nilai wajib diisi.";
         }
     } elseif ($action === 'delete') {
         $idToDelete = (int)$_POST['id'];
@@ -87,7 +128,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-$records = parseDnsRecords($configFile);$rawConfig = file_exists($configFile) ? file_get_contents($configFile) : '';
+$records = parseDnsRecords($configFile);
+$rawConfig = file_exists($configFile) ? file_get_contents($configFile) : '';
 ?>
 <!DOCTYPE html>
 <html lang="id">
@@ -100,16 +142,18 @@ $records = parseDnsRecords($configFile);$rawConfig = file_exists($configFile) ? 
             --bg-body: #f8fafc; --card-bg: #ffffff; --primary: #2563eb;
             --text-dark: #0f172a; --text-muted: #64748b; --border: #e2e8f0;
             --badge-a: #dbeafe; --text-a: #1e40af;
+            --badge-aaaa: #ede9fe; --text-aaaa: #5b21b6;
             --badge-cname: #fef3c7; --text-cname: #92400e;
             --badge-mx: #dcfce7; --text-mx: #166534;
+            --badge-txt: #f1f5f9; --text-txt: #334155;
         }
         body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg-body); color: var(--text-dark); margin: 0; padding: 24px; }
-        .container { max-width: 960px; margin: 0 auto; }
+        .container { max-width: 1000px; margin: 0 auto; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
         .status { background: #dcfce7; color: #15803d; padding: 6px 14px; border-radius: 999px; font-size: 13px; font-weight: bold; }
         .card { background: var(--card-bg); border-radius: 8px; border: 1px solid var(--border); padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
         .card-title { font-size: 15px; font-weight: 600; margin-top: 0; margin-bottom: 14px; }
-        .form-grid { display: grid; grid-template-columns: 140px 1.5fr 1.5fr 90px auto; gap: 10px; align-items: end; }
+        .form-grid { display: grid; grid-template-columns: 130px 1.5fr 1.5fr 90px auto; gap: 10px; align-items: end; }
         .field label { display: block; font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 4px; }
         input, select { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; box-sizing: border-box; font-size: 14px; }
         button.btn-primary { background: var(--primary); color: #fff; border: none; padding: 9px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; }
@@ -118,8 +162,10 @@ $records = parseDnsRecords($configFile);$rawConfig = file_exists($configFile) ? 
         th { background: #f8fafc; color: var(--text-muted); font-size: 12px; }
         .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
         .badge-A { background: var(--badge-a); color: var(--text-a); }
+        .badge-AAAA { background: var(--badge-aaaa); color: var(--text-aaaa); }
         .badge-CNAME { background: var(--badge-cname); color: var(--text-cname); }
         .badge-MX { background: var(--badge-mx); color: var(--text-mx); }
+        .badge-TXT { background: var(--badge-txt); color: var(--text-txt); border: 1px solid #cbd5e1; }
         .btn-del { background: #fee2e2; color: #b91c1c; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; }
         pre { background: #0f172a; color: #38bdf8; padding: 14px; border-radius: 6px; font-family: monospace; font-size: 13px; margin: 0; overflow-x: auto; }
         .msg { padding: 10px; border-radius: 6px; margin-bottom: 15px; font-size: 14px; }
@@ -135,7 +181,7 @@ $records = parseDnsRecords($configFile);$rawConfig = file_exists($configFile) ? 
     <div class="header">
         <div>
             <h2 style="margin:0 0 4px 0;">DNS Zone Editor</h2>
-            <span style="color: var(--text-muted); font-size: 13px;">Pengaturan DNS Simulasi Lab Siswa (dnsmasq)</span>
+            <span style="color: var(--text-muted); font-size: 13px;">Pengaturan DNS Simulasi Lab Linux (dnsmasq)</span>
         </div>
         <div class="status">● dnsmasq Active</div>
     </div>
@@ -150,18 +196,20 @@ $records = parseDnsRecords($configFile);$rawConfig = file_exists($configFile) ? 
             <div class="field">
                 <label>Tipe</label>
                 <select name="type" id="typeSelect" onchange="checkType()">
-                    <option value="A">A (IP)</option>
+                    <option value="A">A (IPv4)</option>
+                    <option value="AAAA">AAAA (IPv6)</option>
                     <option value="CNAME">CNAME (Alias)</option>
                     <option value="MX">MX (Mail)</option>
+                    <option value="TXT">TXT (Text)</option>
                 </select>
             </div>
             <div class="field">
                 <label>Nama Domain</label>
-                <input type="text" name="domain" placeholder="web.sekolah.test" required>
+                <input type="text" name="domain" id="domainField" placeholder="web.sekolah.test" required>
             </div>
             <div class="field">
-                <label id="targetLabel">IP Tujuan</label>
-                <input type="text" name="target" placeholder="192.168.100.10" required>
+                <label id="targetLabel">IP Tujuan (IPv4)</label>
+                <input type="text" name="target" id="targetField" placeholder="192.168.100.10" required>
             </div>
             <div class="field">
                 <label>Prioritas</label>
@@ -187,11 +235,11 @@ $records = parseDnsRecords($configFile);$rawConfig = file_exists($configFile) ? 
                 <?php if (empty($records)): ?>
                     <tr><td colspan="5" style="text-align:center; color: var(--text-muted);">Belum ada DNS record yang ditambahkan.</td></tr>
                 <?php else: ?>
-                    <?php foreach ($records as$r): ?>
+                    <?php foreach ($records as $r): ?>
                         <tr>
                             <td><span class="badge badge-<?= $r['type'] ?>"><?= $r['type'] ?></span></td>
                             <td><strong><?= htmlspecialchars($r['domain']) ?></strong></td>
-                            <td><?= htmlspecialchars($r['target']) ?></td>
+                            <td style="word-break: break-all;"><?= htmlspecialchars($r['target']) ?></td>
                             <td><?= htmlspecialchars($r['priority']) ?></td>
                             <td>
                                 <form method="POST" onsubmit="return confirm('Hapus record ini?');" style="margin:0;">
@@ -218,15 +266,28 @@ function checkType() {
     const t = document.getElementById('typeSelect').value;
     const prio = document.getElementById('prioField');
     const label = document.getElementById('targetLabel');
+    const target = document.getElementById('targetField');
+    
     if (t === 'MX') {
         prio.disabled = false;
         label.innerText = 'Mail Server';
+        target.placeholder = 'mail.sekolah.test';
     } else if (t === 'CNAME') {
         prio.disabled = true;
         label.innerText = 'Domain Asal';
+        target.placeholder = 'sekolah.test';
+    } else if (t === 'AAAA') {
+        prio.disabled = true;
+        label.innerText = 'IP Tujuan (IPv6)';
+        target.placeholder = '2001:db8::10';
+    } else if (t === 'TXT') {
+        prio.disabled = true;
+        label.innerText = 'Nilai / Nilai SPF';
+        target.placeholder = 'v=spf1 a mx ~all';
     } else {
         prio.disabled = true;
-        label.innerText = 'IP Tujuan';
+        label.innerText = 'IP Tujuan (IPv4)';
+        target.placeholder = '192.168.100.10';
     }
 }
 </script>
