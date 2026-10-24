@@ -3,8 +3,9 @@
 # Installer Otomatis DNS Zone Editor (dnsmasq)
 # Repositori: asfydien/dns-ui
 # Port Default: 1919
-# Fitur: Record A/AAAA/CNAME/MX/TXT, Tab Navigasi, 
-#        Pengaturan /etc/resolv.conf
+# Kompatibilitas: Debian 12/13, Proxmox LXC Container, & VM Offline/Online
+# Fitur: Record A/AAAA/CNAME/MX/TXT, Syntax Validation,
+#        Forwarder Upstream DNS, Conflict Resolver, & Query Monitor
 # ==========================================================
 
 set -e
@@ -15,12 +16,21 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-echo "[*] Memperbarui indeks paket dan memasang dependensi (dnsmasq & php-cli)..."
-apt-get update -y > /dev/null
-apt-get install -y dnsmasq php-cli > /dev/null
+echo "[*] Memeriksa dan mematikan potensi konflik port 53 (systemd-resolved)..."
+# Di template LXC Proxmox modern, systemd-resolved sering mengunci port 53 di 127.0.0.53
+if systemctl is-active --quiet systemd-resolved 2>/dev/null || [ -L /etc/resolv.conf ]; then
+    systemctl stop systemd-resolved 2>/dev/null || true
+    systemctl disable systemd-resolved 2>/dev/null || true
+    rm -f /etc/resolv.conf
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
+fi
 
-# 2. Siapkan direktori dan berkas konfigurasi dnsmasq
-echo "[*] Menyiapkan konfigurasi dnsmasq..."
+echo "[*] Memperbarui indeks paket dan memasang dependensi..."
+apt-get update -y > /dev/null
+apt-get install -y dnsmasq php-cli procps > /dev/null
+
+# 2. Siapkan konfigurasi direktori dnsmasq
+echo "[*] Mengonfigurasi parameter jaringan dan lab..."
 mkdir -p /etc/dnsmasq.d
 touch /etc/dnsmasq.d/custom_records.conf
 
@@ -29,20 +39,60 @@ if ! grep -q "^conf-dir=/etc/dnsmasq.d" /etc/dnsmasq.conf 2>/dev/null; then
     echo "conf-dir=/etc/dnsmasq.d/,*.conf" >> /etc/dnsmasq.conf
 fi
 
-# 3. Siapkan direktori aplikasi
+# Siapkan berkas upstream DNS jika terhubung ke internet/LAN Proxmox
+if [ ! -f /etc/dnsmasq.d/01-upstream.conf ]; then
+cat << 'EOF' > /etc/dnsmasq.d/01-upstream.conf
+# Server DNS Forwarder Luar (Digunakan saat mesin memiliki akses internet)
+server=1.1.1.1
+server=8.8.8.8
+EOF
+fi
+
+# Siapkan aturan isolasi lab, logging, dan anti-looping
+cat << 'EOF' > /etc/dnsmasq.d/00-lab-rules.conf
+# Mencegah DNS loop saat /etc/resolv.conf menunjuk ke 127.0.0.1
+no-resolv
+domain-needed
+bogus-priv
+bind-interfaces
+
+# Domain lokal lab hanya diselesaikan di mesin ini
+local=/test/
+
+# Pencatatan kueri DNS
+log-queries
+log-facility=/var/log/dnsmasq.log
+EOF
+
+# Pastikan berkas log tersedia dengan hak akses yang tepat
+touch /var/log/dnsmasq.log
+chown dnsmasq:nogroup /var/log/dnsmasq.log 2>/dev/null || chown root:root /var/log/dnsmasq.log
+chmod 644 /var/log/dnsmasq.log
+
+# 3. Otomatisasi pembukaan firewall jika UFW aktif (misal ada CloudPanel)
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+    echo "[*] Mendeteksi UFW aktif. Membuka port 1919 (TCP) dan 53 (TCP/UDP)..."
+    ufw allow 1919/tcp comment "DNS UI Web Service" > /dev/null
+    ufw allow 53 comment "dnsmasq DNS Server" > /dev/null
+    ufw reload > /dev/null
+fi
+
+# 4. Siapkan direktori aplikasi
 APP_DIR="/opt/dns-ui"
-echo "[*] Menyiapkan direktori aplikasi di ${APP_DIR}..."
+echo "[*] Menyiapkan aplikasi DNS UI di ${APP_DIR}..."
 mkdir -p "${APP_DIR}"
 
-# 4. Tulis aplikasi PHP terintegrasi (Backend + Frontend Tabbed Interface)
+# 5. Tulis kode PHP Web Manager (Dual-Mode VM & Proxmox LAN)
 cat << 'EOF' > "${APP_DIR}/index.php"
 <?php
 session_start();
 
-$configFile = '/etc/dnsmasq.d/custom_records.conf';
-$resolvFile = '/etc/resolv.conf';
+$configFile   = '/etc/dnsmasq.d/custom_records.conf';
+$upstreamFile = '/etc/dnsmasq.d/01-upstream.conf';
+$resolvFile   = '/etc/resolv.conf';
+$logFile      = '/var/log/dnsmasq.log';
 
-// Deteksi alamat IP server aktif
+// Deteksi alamat IP aktif server
 $serverIp = trim(shell_exec("hostname -I | awk '{print $1}'")) ?: ($_SERVER['SERVER_ADDR'] ?? '127.0.0.1');
 
 // Parsing berkas dnsmasq
@@ -122,38 +172,72 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $_SESSION['error'] = "Record {$type} [{$domain}] sudah terdaftar!";
             } else {
                 file_put_contents($configFile, $entry, FILE_APPEND | LOCK_EX);
-                shell_exec('systemctl restart dnsmasq');
-                $_SESSION['message'] = "Record {$type} [{$domain}] berhasil ditambahkan!";
+                exec('dnsmasq --test 2>&1', $testOutput, $testReturn);
+
+                if ($testReturn === 0) {
+                    shell_exec('systemctl restart dnsmasq');
+                    $_SESSION['message'] = "Record {$type} [{$domain}] berhasil ditambahkan!";
+                } else {
+                    file_put_contents($configFile, $currentData, LOCK_EX);
+                    $_SESSION['error'] = "Gagal: Sintaks tidak valid: " . implode(" ", $testOutput);
+                }
             }
         } else {
-            $_SESSION['error'] = "Domain dan Target/Nilai wajib diisi.";
+            $_SESSION['error'] = "Nama domain dan target wajib diisi.";
         }
         header("Location: index.php?tab=records");
         exit;
     } elseif ($action === 'delete') {
         $idToDelete = (int)$_POST['id'];
         $lines = file($configFile, FILE_IGNORE_NEW_LINES);
+        $oldContent = implode("\n", $lines) . "\n";
+
         if (isset($lines[$idToDelete])) {
             unset($lines[$idToDelete]);
-            file_put_contents($configFile, implode("\n", $lines) . (count($lines) > 0 ? "\n" : ""), LOCK_EX);
-            shell_exec('systemctl restart dnsmasq');
-            $_SESSION['message'] = "Record DNS berhasil dihapus.";
+            $newContent = implode("\n", $lines) . (count($lines) > 0 ? "\n" : "");
+            file_put_contents($configFile, $newContent, LOCK_EX);
+
+            exec('dnsmasq --test 2>&1', $testOutput, $testReturn);
+            if ($testReturn === 0) {
+                shell_exec('systemctl restart dnsmasq');
+                $_SESSION['message'] = "Record DNS berhasil dihapus.";
+            } else {
+                file_put_contents($configFile, $oldContent, LOCK_EX);
+                $_SESSION['error'] = "Gagal menghapus: Sintaks dnsmasq bermasalah.";
+            }
         }
         header("Location: index.php?tab=records");
         exit;
     } elseif ($action === 'resolv_local') {
         file_put_contents($resolvFile, "nameserver 127.0.0.1\n", LOCK_EX);
-        $_SESSION['message'] = "DNS Resolver sistem VM berhasil diarahkan ke 127.0.0.1 (Localhost / dnsmasq).";
+        $_SESSION['message'] = "DNS Resolver sistem diarahkan ke 127.0.0.1 (Localhost / dnsmasq).";
         header("Location: index.php?tab=system");
         exit;
     } elseif ($action === 'resolv_custom') {
         $customDns = trim($_POST['custom_dns'] ?? '');
         if (filter_var($customDns, FILTER_VALIDATE_IP)) {
             file_put_contents($resolvFile, "nameserver {$customDns}\n", LOCK_EX);
-            $_SESSION['message'] = "DNS Resolver sistem VM berhasil diubah ke {$customDns}.";
+            $_SESSION['message'] = "DNS Resolver sistem diubah ke {$customDns}.";
         } else {
             $_SESSION['error'] = "Format IP DNS Resolver tidak valid!";
         }
+        header("Location: index.php?tab=system");
+        exit;
+    } elseif ($action === 'update_upstream') {
+        $up1 = trim($_POST['upstream1'] ?? '');
+        $up2 = trim($_POST['upstream2'] ?? '');
+        $conf = "# Server DNS Forwarder Luar\n";
+        if (filter_var($up1, FILTER_VALIDATE_IP)) $conf .= "server={$up1}\n";
+        if (filter_var($up2, FILTER_VALIDATE_IP)) $conf .= "server={$up2}\n";
+
+        file_put_contents($upstreamFile, $conf, LOCK_EX);
+        shell_exec('systemctl restart dnsmasq');
+        $_SESSION['message'] = "DNS Forwarder upstream berhasil diperbarui.";
+        header("Location: index.php?tab=system");
+        exit;
+    } elseif ($action === 'flush_cache') {
+        shell_exec('pkill -HUP dnsmasq || killall -HUP dnsmasq');
+        $_SESSION['message'] = "Cache memori dnsmasq berhasil dibersihkan (Zero-Downtime Flush).";
         header("Location: index.php?tab=system");
         exit;
     } elseif ($action === 'restart_service') {
@@ -182,6 +266,16 @@ if ($rawResolv) {
     }
 }
 
+// Ambil DNS Upstream aktif
+$upstreams = [];
+if (file_exists($upstreamFile)) {
+    preg_match_all('/^server=([^\s]+)/m', file_get_contents($upstreamFile), $mUp);
+    $upstreams = $mUp[1] ?? [];
+}
+
+// Baca 25 baris log DNS terakhir
+$recentLogs = file_exists($logFile) ? shell_exec("tail -n 25 " . escapeshellarg($logFile)) : '';
+
 $activeTab = $_GET['tab'] ?? 'records';
 ?>
 <!DOCTYPE html>
@@ -208,7 +302,6 @@ $activeTab = $_GET['tab'] ?? 'records';
         .ip-badge { background: #e0f2fe; color: #0369a1; padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; border: 1px solid #bae6fd; }
         .status { background: #dcfce7; color: #15803d; padding: 6px 14px; border-radius: 999px; font-size: 13px; font-weight: bold; }
         
-        /* Tab Navigasi */
         .tab-nav { display: flex; gap: 8px; border-bottom: 2px solid var(--border); margin-bottom: 20px; }
         .tab-btn { background: none; border: none; padding: 10px 18px; font-size: 14px; font-weight: 600; color: var(--text-muted); cursor: pointer; border-bottom: 3px solid transparent; margin-bottom: -2px; }
         .tab-btn:hover { color: var(--primary); }
@@ -236,13 +329,14 @@ $activeTab = $_GET['tab'] ?? 'records';
         .badge-MX { background: var(--badge-mx); color: var(--text-mx); }
         .badge-TXT { background: var(--badge-txt); color: var(--text-txt); border: 1px solid #cbd5e1; }
         .btn-del { background: #fee2e2; color: #b91c1c; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; }
-        pre { background: #0f172a; color: #38bdf8; padding: 14px; border-radius: 6px; font-family: monospace; font-size: 13px; margin: 0; overflow-x: auto; }
+        pre { background: #0f172a; color: #38bdf8; padding: 14px; border-radius: 6px; font-family: monospace; font-size: 13px; margin: 0; overflow-x: auto; line-height: 1.5; }
         .msg { padding: 10px; border-radius: 6px; margin-bottom: 15px; font-size: 14px; }
         .msg-success { background: #dcfce7; color: #166534; }
         .msg-error { background: #fee2e2; color: #991b1b; }
         .btn-action { display: inline-block; padding: 8px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; text-decoration: none; border: none; cursor: pointer; }
         .btn-success { background: #059669; color: #fff; }
         .btn-warning { background: #d97706; color: #fff; }
+        .btn-secondary { background: #475569; color: #fff; }
         @media (max-width: 768px) {
             .form-grid { grid-template-columns: 1fr; }
         }
@@ -253,7 +347,7 @@ $activeTab = $_GET['tab'] ?? 'records';
     <div class="header">
         <div>
             <h2 style="margin:0 0 4px 0;">DNS Zone Editor</h2>
-            <span style="color: var(--text-muted); font-size: 13px;">Pengaturan DNS Simulasi Lab Linux (dnsmasq)</span>
+            <span style="color: var(--text-muted); font-size: 13px;">Pengaturan DNS Simulasi Lab & Jaringan Terpusat (dnsmasq)</span>
         </div>
         <div class="header-actions">
             <div class="ip-badge">
@@ -266,7 +360,7 @@ $activeTab = $_GET['tab'] ?? 'records';
     <!-- Navigasi Tab -->
     <div class="tab-nav">
         <button class="tab-btn <?= $activeTab === 'records' ? 'active' : '' ?>" onclick="switchTab('records')">📋 DNS Records</button>
-        <button class="tab-btn <?= $activeTab === 'system' ? 'active' : '' ?>" onclick="switchTab('system')">⚙️ System Resolver</button>
+        <button class="tab-btn <?= $activeTab === 'system' ? 'active' : '' ?>" onclick="switchTab('system')">⚙️ Sistem & Diagnostik</button>
     </div>
 
     <?php if ($message): ?><div class="msg msg-success"><?= htmlspecialchars($message) ?></div><?php endif; ?>
@@ -290,14 +384,14 @@ $activeTab = $_GET['tab'] ?? 'records';
                 </div>
                 <div class="field">
                     <label>Nama Domain</label>
-                    <input type="text" name="domain" id="domainField" placeholder="web.sekolah.test" required>
+                    <input type="text" name="domain" id="domainField" placeholder="kelompok1.test" required>
                 </div>
                 <div class="field">
                     <div class="field-header">
-                        <label id="targetLabel">IP Tujuan (IPv4)</label>
+                        <label id="targetLabel">IP Tujuan (IPv4 Target)</label>
                         <button type="button" id="btnFillIp" class="btn-link" onclick="pasteServerIp()">Gunakan IP Server</button>
                     </div>
-                    <input type="text" name="target" id="targetField" placeholder="192.168.100.10" required>
+                    <input type="text" name="target" id="targetField" placeholder="192.168.1.50" required>
                 </div>
                 <div class="field">
                     <label>Prioritas</label>
@@ -349,19 +443,18 @@ $activeTab = $_GET['tab'] ?? 'records';
         </div>
     </div>
 
-    <!-- TAB 2: SYSTEM RESOLVER & OPSI -->
+    <!-- TAB 2: SISTEM & DIAGNOSTIK -->
     <div id="tab-system" class="tab-content <?= $activeTab === 'system' ? 'active' : '' ?>">
         <div class="card">
-            <div class="card-title">DNS Resolver Sistem VM (<code>/etc/resolv.conf</code>)</div>
+            <div class="card-title">DNS Resolver Internal Sistem (<code>/etc/resolv.conf</code>)</div>
             <p style="font-size: 13px; color: var(--text-muted); margin-top: 0;">
-                Nameserver yang tercantum di sini digunakan oleh sistem operasi VM (termasuk CloudPanel & Nginx) untuk menyelesaikan nama domain.
+                Resolver ini digunakan oleh mesin ini sendiri untuk menerjemahkan nama host. Pada mode lab offline, arahkan ke 127.0.0.1 agar tidak terjadi jeda waktu tunggu (timeout).
             </p>
             <div style="background: #f1f5f9; padding: 12px; border-radius: 6px; margin-bottom: 16px; font-size: 14px;">
                 Nameserver Aktif: <strong style="color: #0f172a;"><?= htmlspecialchars($currentResolv) ?></strong>
             </div>
 
             <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-                <!-- Shortcut 127.0.0.1 -->
                 <form method="POST" style="margin: 0;">
                     <input type="hidden" name="action" value="resolv_local">
                     <button type="submit" class="btn-action btn-success">
@@ -369,29 +462,50 @@ $activeTab = $_GET['tab'] ?? 'records';
                     </button>
                 </form>
 
-                <!-- Input Custom DNS -->
                 <form method="POST" style="display: flex; gap: 8px; margin: 0; align-items: center;">
                     <input type="hidden" name="action" value="resolv_custom">
                     <input type="text" name="custom_dns" placeholder="Contoh: 1.1.1.1" style="width: 150px; padding: 8px;" required>
-                    <button type="submit" class="btn-action" style="background: #334155; color: #fff;">Simpan DNS</button>
+                    <button type="submit" class="btn-action btn-secondary">Simpan DNS</button>
                 </form>
             </div>
         </div>
 
         <div class="card">
-            <div class="card-title">Kontrol Layanan dnsmasq</div>
+            <div class="card-title">DNS Forwarder Luar (Upstream DNS)</div>
             <p style="font-size: 13px; color: var(--text-muted); margin-top: 0;">
-                Muat ulang proses daemon dnsmasq jika ada perubahan konfigurasi manual di terminal.
+                Digunakan untuk meneruskan kueri domain publik (misalnya google.com) saat server terhubung ke jaringan internet Proxmox/LAN.
             </p>
-            <form method="POST" style="margin: 0;">
-                <input type="hidden" name="action" value="restart_service">
-                <button type="submit" class="btn-action btn-warning">🔄 Restart dnsmasq Service</button>
+            <form method="POST" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                <input type="hidden" name="action" value="update_upstream">
+                <input type="text" name="upstream1" value="<?= htmlspecialchars($upstreams[0] ?? '1.1.1.1') ?>" placeholder="Upstream 1 (1.1.1.1)" style="width: 160px; padding: 8px;" required>
+                <input type="text" name="upstream2" value="<?= htmlspecialchars($upstreams[1] ?? '8.8.8.8') ?>" placeholder="Upstream 2 (8.8.8.8)" style="width: 160px; padding: 8px;">
+                <button type="submit" class="btn-action btn-secondary">Perbarui Forwarder</button>
             </form>
         </div>
 
         <div class="card">
-            <div class="card-title">Isi Berkas: <code>/etc/resolv.conf</code></div>
-            <pre><?= htmlspecialchars($rawResolv) ?: '# Berkas kosong' ?></pre>
+            <div class="card-title">Utilitas Layanan</div>
+            <p style="font-size: 13px; color: var(--text-muted); margin-top: 0;">
+                Gunakan <em>Flush DNS Cache</em> untuk menghapus memori peramban/cache seketika saat mengubah rute IP, atau <em>Restart</em> untuk memulai ulang daemon.
+            </p>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                <form method="POST" style="margin: 0;">
+                    <input type="hidden" name="action" value="flush_cache">
+                    <button type="submit" class="btn-action" style="background: #0284c7; color: #fff;">🧹 Flush DNS Cache (SIGHUP)</button>
+                </form>
+                <form method="POST" style="margin: 0;">
+                    <input type="hidden" name="action" value="restart_service">
+                    <button type="submit" class="btn-action btn-warning">🔄 Restart dnsmasq Service</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="card">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                <div class="card-title" style="margin-bottom: 0;">Live DNS Query Monitor (25 Kueri Terakhir)</div>
+                <button onclick="location.reload()" class="btn-link" style="font-size: 13px;">🔄 Segarkan Log</button>
+            </div>
+            <pre><?= htmlspecialchars($recentLogs) ?: '# Belum ada aktivitas kueri yang tercatat di /var/log/dnsmasq.log' ?></pre>
         </div>
     </div>
 </div>
@@ -426,12 +540,12 @@ function checkType() {
     if (t === 'MX') {
         prio.disabled = false;
         label.innerText = 'Mail Server';
-        target.placeholder = 'mail.sekolah.test';
+        target.placeholder = 'mail.kelompok1.test';
         btnFillIp.style.display = 'none';
     } else if (t === 'CNAME') {
         prio.disabled = true;
         label.innerText = 'Domain Asal';
-        target.placeholder = 'sekolah.test';
+        target.placeholder = 'kelompok1.test';
         btnFillIp.style.display = 'none';
     } else if (t === 'AAAA') {
         prio.disabled = true;
@@ -445,8 +559,8 @@ function checkType() {
         btnFillIp.style.display = 'none';
     } else {
         prio.disabled = true;
-        label.innerText = 'IP Tujuan (IPv4)';
-        target.placeholder = '192.168.100.10';
+        label.innerText = 'IP Tujuan (IPv4 Target)';
+        target.placeholder = '192.168.1.50';
         btnFillIp.style.display = 'inline';
     }
 }
@@ -455,7 +569,7 @@ function checkType() {
 </html>
 EOF
 
-# 5. Pasang systemd service pada port 1919
+# 6. Pasang dan jalankan unit systemd
 echo "[*] Mendaftarkan systemd service (dns-ui.service) pada port 1919..."
 cat << EOF > /etc/systemd/system/dns-ui.service
 [Unit]
@@ -474,7 +588,6 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-# 6. Muat ulang daemon dan jalankan service
 echo "[*] Mengaktifkan dan menjalankan service..."
 systemctl daemon-reload
 systemctl enable --now dns-ui.service
@@ -485,9 +598,9 @@ IP_ADDR=$(hostname -I | awk '{print $1}')
 
 echo ""
 echo "=========================================================="
-echo " [V] Instalasi Berhasil!"
+echo " [V] Instalasi & Optimasi Berhasil!"
 echo "=========================================================="
-echo " Layanan Web DNS Manager berjalan pada port 1919."
-echo " DNS Server IP : ${IP_ADDR}"
-echo " Akses Browser : http://${IP_ADDR}:1919"
+echo " Mode Operasi   : Hybrid (Standalone VM / Proxmox LAN)"
+echo " Layanan Web    : http://${IP_ADDR}:1919"
+echo " DNS Server IP  : ${IP_ADDR}"
 echo "=========================================================="
