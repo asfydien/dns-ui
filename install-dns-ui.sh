@@ -3,7 +3,7 @@
 # Installer Otomatis DNS Zone Editor (dnsmasq)
 # Repositori: asfydien/dns-ui
 # Port Default: 1919
-# Fitur: Record A, AAAA, CNAME, MX, TXT
+# Fitur: Record A, AAAA, CNAME, MX, TXT, Proteksi PRG, & Info IP Server
 # ==========================================================
 
 set -e
@@ -33,12 +33,15 @@ APP_DIR="/opt/dns-ui"
 echo "[*] Menyiapkan direktori aplikasi di ${APP_DIR}..."
 mkdir -p "${APP_DIR}"
 
-# 4. Tulis aplikasi PHP terintegrasi (Backend + Frontend dengan PRG Pattern)
+# 4. Tulis aplikasi PHP terintegrasi (Backend + Frontend)
 cat << 'EOF' > "${APP_DIR}/index.php"
 <?php
 session_start();
 
 $configFile = '/etc/dnsmasq.d/custom_records.conf';
+
+// Deteksi alamat IP aktif server
+$serverIp = trim(shell_exec("hostname -I | awk '{print $1}'")) ?: ($_SERVER['SERVER_ADDR'] ?? '127.0.0.1');
 
 // Parsing berkas dnsmasq ke array terstruktur
 function parseDnsRecords($filePath) {
@@ -135,7 +138,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // Pola PRG (Post/Redirect/Get) untuk mencegah resubmission saat refresh
+    // Pola PRG (Post/Redirect/Get)
     header("Location: index.php");
     exit;
 }
@@ -166,12 +169,17 @@ $rawConfig = file_exists($configFile) ? file_get_contents($configFile) : '';
         }
         body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg-body); color: var(--text-dark); margin: 0; padding: 24px; }
         .container { max-width: 1000px; margin: 0 auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+        .header-actions { display: flex; gap: 10px; align-items: center; }
+        .ip-badge { background: #e0f2fe; color: #0369a1; padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; border: 1px solid #bae6fd; }
         .status { background: #dcfce7; color: #15803d; padding: 6px 14px; border-radius: 999px; font-size: 13px; font-weight: bold; }
         .card { background: var(--card-bg); border-radius: 8px; border: 1px solid var(--border); padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
         .card-title { font-size: 15px; font-weight: 600; margin-top: 0; margin-bottom: 14px; }
         .form-grid { display: grid; grid-template-columns: 130px 1.5fr 1.5fr 90px auto; gap: 10px; align-items: end; }
         .field label { display: block; font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 4px; }
+        .field-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+        .field-header label { margin-bottom: 0; }
+        .btn-link { background: none; border: none; color: var(--primary); font-size: 11px; cursor: pointer; text-decoration: underline; padding: 0; font-family: inherit; }
         input, select { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; box-sizing: border-box; font-size: 14px; }
         button.btn-primary { background: var(--primary); color: #fff; border: none; padding: 9px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; }
         table { width: 100%; border-collapse: collapse; font-size: 14px; }
@@ -200,7 +208,12 @@ $rawConfig = file_exists($configFile) ? file_get_contents($configFile) : '';
             <h2 style="margin:0 0 4px 0;">DNS Zone Editor</h2>
             <span style="color: var(--text-muted); font-size: 13px;">Pengaturan DNS Simulasi Lab Linux (dnsmasq)</span>
         </div>
-        <div class="status">● dnsmasq Active</div>
+        <div class="header-actions">
+            <div class="ip-badge">
+                DNS Server IP: <strong id="currentIp" style="font-family: monospace; font-size: 14px;"><?= htmlspecialchars($serverIp) ?></strong>
+            </div>
+            <div class="status">● dnsmasq Active</div>
+        </div>
     </div>
 
     <?php if ($message): ?><div class="msg msg-success"><?= htmlspecialchars($message) ?></div><?php endif; ?>
@@ -225,7 +238,10 @@ $rawConfig = file_exists($configFile) ? file_get_contents($configFile) : '';
                 <input type="text" name="domain" id="domainField" placeholder="web.sekolah.test" required>
             </div>
             <div class="field">
-                <label id="targetLabel">IP Tujuan (IPv4)</label>
+                <div class="field-header">
+                    <label id="targetLabel">IP Tujuan (IPv4)</label>
+                    <button type="button" id="btnFillIp" class="btn-link" onclick="pasteServerIp()">Gunakan IP Server</button>
+                </div>
                 <input type="text" name="target" id="targetField" placeholder="192.168.100.10" required>
             </div>
             <div class="field">
@@ -279,32 +295,43 @@ $rawConfig = file_exists($configFile) ? file_get_contents($configFile) : '';
 </div>
 
 <script>
+function pasteServerIp() {
+    const serverIp = document.getElementById('currentIp').innerText;
+    document.getElementById('targetField').value = serverIp;
+}
+
 function checkType() {
     const t = document.getElementById('typeSelect').value;
     const prio = document.getElementById('prioField');
     const label = document.getElementById('targetLabel');
     const target = document.getElementById('targetField');
+    const btnFillIp = document.getElementById('btnFillIp');
     
     if (t === 'MX') {
         prio.disabled = false;
         label.innerText = 'Mail Server';
         target.placeholder = 'mail.sekolah.test';
+        btnFillIp.style.display = 'none';
     } else if (t === 'CNAME') {
         prio.disabled = true;
         label.innerText = 'Domain Asal';
         target.placeholder = 'sekolah.test';
+        btnFillIp.style.display = 'none';
     } else if (t === 'AAAA') {
         prio.disabled = true;
         label.innerText = 'IP Tujuan (IPv6)';
         target.placeholder = '2001:db8::10';
+        btnFillIp.style.display = 'none';
     } else if (t === 'TXT') {
         prio.disabled = true;
         label.innerText = 'Nilai / Nilai SPF';
         target.placeholder = 'v=spf1 a mx ~all';
+        btnFillIp.style.display = 'none';
     } else {
         prio.disabled = true;
         label.innerText = 'IP Tujuan (IPv4)';
         target.placeholder = '192.168.100.10';
+        btnFillIp.style.display = 'inline';
     }
 }
 </script>
@@ -345,5 +372,6 @@ echo "=========================================================="
 echo " [V] Instalasi Berhasil!"
 echo "=========================================================="
 echo " Layanan Web DNS Manager berjalan pada port 1919."
-echo " Akses dari browser PC Host: http://${IP_ADDR}:1919"
+echo " DNS Server IP : ${IP_ADDR}"
+echo " Akses Browser : http://${IP_ADDR}:1919"
 echo "=========================================================="
