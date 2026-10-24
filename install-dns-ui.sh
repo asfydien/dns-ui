@@ -579,6 +579,7 @@ After=network.target dnsmasq.service
 [Service]
 Type=simple
 User=root
+Environment=PHP_CLI_SERVER_WORKERS=4
 WorkingDirectory=${APP_DIR}
 ExecStart=/usr/bin/php -S 0.0.0.0:1919 -t ${APP_DIR}
 Restart=always
